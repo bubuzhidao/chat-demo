@@ -1,13 +1,15 @@
 import clsx from 'clsx'
 import { memo, useCallback, useEffect, useLayoutEffect, useRef } from 'react'
 import {
+  IconDataOutline16,
   IconGlobeLanguageOutline14,
+  IconLoadingOutline16,
   IconPaperclipOutline16,
   IconSendOutline16,
   IconStopFill16,
   IconThinkOutline14,
 } from '../base/icons.js'
-import { setSearch, setThinking, useSettings } from '../../services/settings.js'
+import { setCompressContext, setSearch, setThinking, useSettings } from '../../services/settings.js'
 import { useIsMobile } from '../../app/viewport.js'
 import { sendMessage, stopReply, useChatStore } from '../../services/chat/store.js'
 import {
@@ -53,6 +55,10 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const importingHistory = useChatStore((state) => state.importingHistory)
   const isMobile = useIsMobile()
   const search = useSettings((state) => state.search)
+  const compressContext = useSettings((state) => state.compressContext)
+  const compressing = useChatStore(
+    (state) => sessionId !== null && state.compressing[sessionId] === true
+  )
   const fileInputRef = useRef<HTMLInputElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const togglesRef = useRef<HTMLDivElement>(null)
@@ -130,7 +136,8 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const recording = voice.status === 'recording'
 
   // 排队、上传中或上传失败的附件都留在输入框，全部上传成功后才能发送
-  const canSend = !importingHistory && !streaming && voice.status === 'idle' && draftReady
+  const canSend =
+    !importingHistory && !streaming && !compressing && voice.status === 'idle' && draftReady
 
   const send = () => {
     if (
@@ -226,6 +233,18 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
               <span className={styles.toggleLabel}>{t('search')}</span>
             </button>
           </Tooltip>
+          <Tooltip content={t('compressContextTooltip')}>
+            <button
+              type="button"
+              className={clsx(styles.toggle, compressContext && styles.selected)}
+              aria-label={t('compressContext')}
+              aria-pressed={compressContext}
+              onClick={() => setCompressContext(!compressContext)}
+            >
+              <IconDataOutline16 />
+              <span className={styles.toggleLabel}>{t('compressContext')}</span>
+            </button>
+          </Tooltip>
         </div>
         <div className={styles.right}>
           <VoiceButton
@@ -260,7 +279,17 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
               event.target.value = ''
             }}
           />
-          {streaming && sessionId ? (
+          {compressing ? (
+            <button
+              type="button"
+              className={clsx(styles.sendButton, styles.disabled)}
+              aria-label={t('compressing')}
+              aria-disabled
+              disabled
+            >
+              <IconLoadingOutline16 />
+            </button>
+          ) : streaming && sessionId ? (
             <button
               type="button"
               className={styles.sendButton}

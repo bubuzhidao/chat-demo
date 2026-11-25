@@ -143,6 +143,10 @@ export const en = {
   thinkingSwitch: 'DeepThink',
   deactivatedSearchTooltip: 'Search the web when necessary',
   search: 'Search',
+  compressContext: 'Compress context (cheaper, keeps tools)',
+  compressContextTooltip:
+    'Summarizes early text turns and keeps attachments intact; below 30K tokens the safety check and web tools come back',
+  compressing: 'Compressing context',
   uploadFile: 'Upload files',
   chatInputStopButtonTooltip: 'Stop',
   uploadMaxMBSize: 'File exceeds the size limit ({size} MB). Please adjust and try again.',

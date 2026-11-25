@@ -186,6 +186,12 @@ export type CreateMessageRequest = {
 
 // ---------- 响应：流式事件 ----------
 
+/** 非流式响应；摘要等轻量请求只读取其中的 text 块 */
+export type MessageResponse = {
+  content: Array<{ type: string; text?: string }>
+  stop_reason?: StopReason | null
+}
+
 export type StopReason = 'end_turn' | 'max_tokens' | 'tool_use' | 'refusal'
 
 export type StopDetails = { type: 'refusal'; category: null; explanation: null }

@@ -7,6 +7,7 @@ import type {
   CreateMessageRequest,
   FileObject,
   FilePurpose,
+  MessageResponse,
   MessageStreamEvent,
 } from './types.js'
 
@@ -137,6 +138,31 @@ const hasFile = (body: CreateMessageRequest) =>
       typeof message.content !== 'string' &&
       message.content.some((block) => block.type === 'image' || block.type === 'document')
   )
+
+/**
+ * POST /anthropic/v1/messages（stream: false），返回所有 text 块拼接后的正文。
+ * 用于上下文摘要这类不需要流式渲染的轻量请求。
+ */
+export const completeMessage = async (
+  apiKey: string,
+  body: CreateMessageRequest,
+  signal: AbortSignal
+): Promise<string> => {
+  const response = await request(`${ANTHROPIC_BASE_URL}/messages`, {
+    method: 'POST',
+    headers: {
+      ...anthropicHeaders(apiKey, hasFile(body)),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ ...body, stream: false }),
+    signal,
+  })
+  const data = (await response.json()) as MessageResponse
+  return data.content
+    .filter((block) => block.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text ?? '')
+    .join('')
+}
 
 /**
  * POST /anthropic/v1/messages（stream: true），逐个产出流式事件，收到 message_stop 时结束。

@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import { getAbortReason, throwIfAborted } from '../../utils/abort.js'
 import { createId } from '../../utils/id.js'
-import { ApiError, streamMessage } from '../api/client.js'
+import { ApiError, completeMessage, streamMessage } from '../api/client.js'
 import type { ChatModel, CreateMessageRequest, MessageParam } from '../api/types.js'
 import { extractFileIds, getFileErrorCode, isRetryableApiError } from '../api/errors.js'
 import {
@@ -57,6 +57,16 @@ const FILE_RETRY_BASE_DELAY = 1000
  * 不声明则可用满 1M 上下文。这里留 2768 token 余量。
  */
 const EXTENSION_TOKEN_LIMIT = 30000
+/** 纯文本历史超过该值时，按用户开关触发上下文压缩 */
+const COMPRESS_TEXT_LIMIT = 25000
+/** 可压缩部分低于该值时不值得额外发一次摘要请求 */
+const COMPRESS_MIN_TOKENS = 5000
+/** 压缩器提示词：只提取事实与结论，控制在 800 字内 */
+const COMPRESS_PROMPT =
+  '你是一个上下文压缩器。请提取以下对话的核心事实、已确认结论、未完成任务以及关键参数。压缩成 800 字以内的纯文本，不要遗漏重要信息。'
+/** 转写摘要输入时，单条消息与总输入的截断上限（字符） */
+const SUMMARY_MESSAGE_LIMIT = 4000
+const SUMMARY_INPUT_LIMIT = 20000
 
 /** 阅读链接始终开启，智能搜索开关控制是否另行声明搜索工具（含边想边搜）。 */
 const serverTools = (search: boolean): NonNullable<CreateMessageRequest['tools']> => {
@@ -70,10 +80,10 @@ const serverTools = (search: boolean): NonNullable<CreateMessageRequest['tools']
 }
 
 /**
- * 粗略估算请求 token 数：实测汉字约 1 token/字，ASCII 约 0.3 token/字符（4 字符/token）。
- * 附件和阅读链接的正文体积在本地无法精确得知，一律按超长处理（扩展模式本身不支持 document 块）。
+ * 统计请求体积：textTokens 只统计纯文本，hasDoc 标记是否带图片/文档。
+ * 汉字实测约 1 token/字，ASCII 约 0.3 token/字符（4 字符/token）。
  */
-const estimateTokens = (messages: MessageParam[], system: string): number => {
+const measureContext = (messages: MessageParam[], system: string) => {
   const count = (text: string) => {
     let tokens = 0
     for (let i = 0; i < text.length; i++) {
@@ -81,25 +91,147 @@ const estimateTokens = (messages: MessageParam[], system: string): number => {
     }
     return tokens
   }
-  let tokens = count(system)
+  let textTokens = count(system)
+  let hasDoc = false
   for (const message of messages) {
     if (typeof message.content === 'string') {
-      tokens += count(message.content)
+      textTokens += count(message.content)
       continue
     }
     for (const block of message.content) {
       if (block.type === 'text') {
-        tokens += count(block.text)
+        textTokens += count(block.text)
       } else if (block.type === 'thinking') {
-        tokens += count(block.thinking) + count(block.signature)
-      } else if (block.type === 'server_tool_use') {
-        tokens += count(JSON.stringify(block.input))
+        textTokens += count(block.thinking) + count(block.signature)
+      } else if (block.type === 'image' || block.type === 'document') {
+        hasDoc = true
       } else {
-        return Number.POSITIVE_INFINITY
+        textTokens += count(JSON.stringify(block))
       }
     }
   }
-  return Math.ceil(tokens)
+  return { textTokens: Math.ceil(textTokens), hasDoc }
+}
+
+/** 纯文本消息的正文；含附件或非文本块时返回 null，压缩在此处止步 */
+const plainText = (message: MessageParam): string | null => {
+  if (typeof message.content === 'string') {
+    return message.content
+  }
+  if (message.content.every((block) => block.type === 'text')) {
+    return message.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n')
+  }
+  return null
+}
+
+/** 已压缩前缀的缓存：前缀长度与内容签名不变时复用摘要，避免长会话每轮重复压缩 */
+const summaryCache = new Map<string, { through: number; signature: number; summary: string }>()
+
+type CompressResult = { messages: MessageParam[]; summary: string; saved: number }
+
+/**
+ * 压缩较早的纯文本历史：最近 3 轮、附件所在轮次及其之后的内容全部原样保留。
+ * 摘要注入顶层 system，不插入消息数组，避免破坏 user/assistant 配对与附件引用。
+ * 任何失败都返回 null，由调用方退回原始历史继续发送。
+ */
+const compressHistory = async (
+  sessionId: string,
+  messages: MessageParam[],
+  signal: AbortSignal
+): Promise<CompressResult | null> => {
+  const userIndexes: number[] = []
+  messages.forEach((message, index) => {
+    if (message.role === 'user') {
+      userIndexes.push(index)
+    }
+  })
+  if (userIndexes.length <= 3) {
+    return null
+  }
+  const keepStart = userIndexes[userIndexes.length - 3] ?? 0
+  // 从旧到新收集连续纯文本消息；遇到附件或工具结果立即停止，绝不丢弃附件
+  let prefixEnd = 0
+  for (let index = 0; index < keepStart; index += 1) {
+    const message = messages[index]
+    if (!message) {
+      break
+    }
+    // latest_reminder 是每轮注入的时间/位置快照，可以随早期历史一起压缩
+    if (message.role === 'latest_reminder') {
+      prefixEnd = index + 1
+      continue
+    }
+    if (message.role !== 'user' && message.role !== 'assistant') {
+      break
+    }
+    if (plainText(message) === null) {
+      break
+    }
+    prefixEnd = index + 1
+  }
+  // 只压缩完整轮次，不把提问与它对应的回答拆开
+  if (prefixEnd > 0 && messages[prefixEnd - 1]?.role === 'user') {
+    prefixEnd -= 1
+  }
+  if (prefixEnd <= 0) {
+    return null
+  }
+  const prefix = messages.slice(0, prefixEnd)
+  // 被压缩的前缀里若带着唯一一条提醒快照，搬到保留窗口前面，避免整轮对话丢失时间/位置
+  const reminder = prefix.filter((message) => message.role === 'latest_reminder').at(-1)
+  const kept = messages.slice(prefixEnd)
+  const rest: MessageParam[] =
+    reminder && !kept.some((message) => message.role === 'latest_reminder')
+      ? [reminder, ...kept]
+      : kept
+  const before = measureContext(prefix, '').textTokens
+  if (before < COMPRESS_MIN_TOKENS) {
+    return null
+  }
+  const signature = prefix.reduce((sum, message) => sum + (plainText(message)?.length ?? 0), 0)
+  /** 节省量 = 被移除前缀的文本 token − 摘要文本 token；缓存复用时同样成立 */
+  const savedFor = (text: string) =>
+    Math.max(0, before - measureContext([{ role: 'user', content: text }], '').textTokens)
+  const cached = summaryCache.get(sessionId)
+  if (cached && cached.through === prefixEnd && cached.signature === signature) {
+    return { messages: rest, summary: cached.summary, saved: savedFor(cached.summary) }
+  }
+  const lines: string[] = []
+  let budget = SUMMARY_INPUT_LIMIT
+  for (const message of prefix) {
+    if (message.role !== 'user' && message.role !== 'assistant') {
+      continue
+    }
+    const text = plainText(message)?.trim()
+    if (!text) {
+      continue
+    }
+    const piece = `${message.role === 'user' ? '用户' : '助手'}：${text.slice(0, SUMMARY_MESSAGE_LIMIT)}`
+    if (piece.length >= budget) {
+      lines.push(piece.slice(0, budget))
+      break
+    }
+    lines.push(piece)
+    budget -= piece.length
+  }
+  const summary = (
+    await completeMessage(
+      useSettings.getState().apiKey ?? '',
+      {
+        model: MODEL,
+        system: COMPRESS_PROMPT,
+        messages: [{ role: 'user', content: lines.join('\n\n') }],
+        thinking: { type: 'disabled' },
+        max_tokens: 1000,
+      },
+      signal
+    )
+  ).trim()
+  if (!summary) {
+    return null
+  }
+  summaryCache.set(sessionId, { through: prefixEnd, signature, summary })
+  return { messages: rest, summary, saved: savedFor(summary) }
 }
 
 /** 补标题请求只取首条提问与回答的开头，输入远小于 32768 token */
@@ -174,6 +306,8 @@ type ChatState = {
   activeId: string | null
   /** 正在生成回复的会话 */
   streaming: Record<string, AbortController>
+  /** 正在压缩上下文的会话（发送前摘要） */
+  compressing: Record<string, boolean>
 }
 
 export const useChatStore = create<ChatState>(() => ({
@@ -186,6 +320,7 @@ export const useChatStore = create<ChatState>(() => ({
   sessionSaveErrors: {},
   activeId: null,
   streaming: {},
+  compressing: {},
 }))
 
 const { getState: get, setState: set } = useChatStore
@@ -1111,13 +1246,37 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
         reply = { ...reply, latestReminder }
         updateReply(sessionId, reply)
         persist(sessionId)
-        const messages = toRequestMessages(
+        let messages = toRequestMessages(
           prepared.history,
           prepared.question,
           prepared.prefix,
           initial.thinking ?? false,
           latestReminder
         )
+        let systemText = SYSTEM_PROMPT
+        let savedTokens = 0
+        let compressed = false
+        // 用户开启后，纯文本超长时压缩早期轮次；附件所在轮次不会被压缩
+        if (useSettings.getState().compressContext) {
+          const before = measureContext(messages, systemText)
+          if (before.textTokens > COMPRESS_TEXT_LIMIT) {
+            set((state) => ({ compressing: { ...state.compressing, [sessionId]: true } }))
+            try {
+              const result = await compressHistory(sessionId, messages, controller.signal)
+              if (result) {
+                messages = result.messages
+                systemText = `${SYSTEM_PROMPT}\n\n【早期对话摘要】：${result.summary}`
+                savedTokens = result.saved
+                compressed = true
+              }
+            } catch {
+              // eslint-disable-next-line no-console
+              console.warn('⚠️ 上下文压缩失败，已退回原始历史继续发送。')
+            } finally {
+              set((state) => ({ compressing: { ...state.compressing, [sessionId]: false } }))
+            }
+          }
+        }
         /**
          * ⚠ 核心避坑指南：
          * 官方 API 对 safety_check、deepseek_read_url、deepseek_web_search 这三个扩展存在 32K 的隐藏输入硬限制。
@@ -1126,7 +1285,14 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
          * 当上下文累计超长，或带有 document(file_id) 附件时，必须走 extensions = false 分支，
          * 剥离上述扩展以启用原生 1M 通道。
          */
-        const extensions = estimateTokens(messages, SYSTEM_PROMPT) <= EXTENSION_TOKEN_LIMIT
+        const context = measureContext(messages, systemText)
+        const extensions = !context.hasDoc && context.textTokens <= EXTENSION_TOKEN_LIMIT
+        if (compressed && savedTokens > 0) {
+          // eslint-disable-next-line no-console
+          console.log(
+            `✅ 纯文本历史已压缩，节省了 ${savedTokens} tokens。${extensions ? '当前恢复扩展模式。' : ''}`
+          )
+        }
         needsTitleFallback ||= !extensions
         if (!extensions) {
           // eslint-disable-next-line no-console
@@ -1138,7 +1304,7 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           useSettings.getState().apiKey ?? '',
           {
             model: initial.model ?? MODEL,
-            system: SYSTEM_PROMPT,
+            system: systemText,
             messages,
             thinking: { type: initial.thinking ? 'enabled' : 'disabled' },
             ...(extensions
