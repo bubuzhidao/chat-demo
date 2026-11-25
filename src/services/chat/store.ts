@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import { getAbortReason, throwIfAborted } from '../../utils/abort.js'
 import { createId } from '../../utils/id.js'
 import { ApiError, streamMessage } from '../api/client.js'
-import type { ChatModel, CreateMessageRequest } from '../api/types.js'
+import type { ChatModel, CreateMessageRequest, MessageParam } from '../api/types.js'
 import { extractFileIds, getFileErrorCode, isRetryableApiError } from '../api/errors.js'
 import {
   cancelUpload,
@@ -26,6 +26,7 @@ import {
   applyEvent,
   canContinueReply,
   getContextRounds,
+  getReplyText,
   settleReply,
   toRequestMessages,
 } from './reply.js'
@@ -51,16 +52,109 @@ const SAFETY_CHECK = { level: 'high' } as const
 const FILE_RETRY_LIMIT = 2
 /** 退避基数，第 n 次重试等待 2^n 倍；连续失败达到上限就放弃，把原始报错展示出来 */
 const FILE_RETRY_BASE_DELAY = 1000
+/**
+ * 声明 safety_check、deepseek_read_url 等服务端扩展时，服务端把单次输入上限压到 32768 token；
+ * 不声明则可用满 1M 上下文。这里留 2768 token 余量。
+ */
+const EXTENSION_TOKEN_LIMIT = 30000
 
 /** 阅读链接始终开启，智能搜索开关控制是否另行声明搜索工具（含边想边搜）。 */
-const serverTools = (search: boolean): CreateMessageRequest['tools'] => {
-  const tools: CreateMessageRequest['tools'] = [
+const serverTools = (search: boolean): NonNullable<CreateMessageRequest['tools']> => {
+  const tools: NonNullable<CreateMessageRequest['tools']> = [
     { type: 'deepseek_read_url', name: 'deepseek_read_url' },
   ]
   if (search) {
     tools.push({ type: 'deepseek_web_search', name: 'deepseek_web_search' })
   }
   return tools
+}
+
+/**
+ * 粗略估算请求 token 数：实测汉字约 1 token/字，ASCII 约 0.3 token/字符（4 字符/token）。
+ * 附件和阅读链接的正文体积在本地无法精确得知，一律按超长处理（扩展模式本身不支持 document 块）。
+ */
+const estimateTokens = (messages: MessageParam[], system: string): number => {
+  const count = (text: string) => {
+    let tokens = 0
+    for (let i = 0; i < text.length; i++) {
+      tokens += text.charCodeAt(i) >= 0x2e80 ? 1 : 0.3
+    }
+    return tokens
+  }
+  let tokens = count(system)
+  for (const message of messages) {
+    if (typeof message.content === 'string') {
+      tokens += count(message.content)
+      continue
+    }
+    for (const block of message.content) {
+      if (block.type === 'text') {
+        tokens += count(block.text)
+      } else if (block.type === 'thinking') {
+        tokens += count(block.thinking) + count(block.signature)
+      } else if (block.type === 'server_tool_use') {
+        tokens += count(JSON.stringify(block.input))
+      } else {
+        return Number.POSITIVE_INFINITY
+      }
+    }
+  }
+  return Math.ceil(tokens)
+}
+
+/** 补标题请求只取首条提问与回答的开头，输入远小于 32768 token */
+const TITLE_INPUT_LIMIT = 600
+
+/**
+ * 超长请求不能携带 title（同样会触发 32768 输入上限），回复结束后用一次很小的独立请求补标题。
+ * 失败、停止或已有标题时直接跳过，不影响主流程。
+ */
+const requestTitle = async (sessionId: string, question: string, answer: string) => {
+  const session = getSession(sessionId)
+  if (!session || session.title?.trim() || !question.trim()) {
+    return
+  }
+  const messages: MessageParam[] = [
+    { role: 'user', content: question.slice(0, TITLE_INPUT_LIMIT) },
+  ]
+  if (answer.trim()) {
+    messages.push({
+      role: 'assistant',
+      content: [{ type: 'text', text: answer.slice(0, TITLE_INPUT_LIMIT) }],
+    })
+  }
+  const controller = new AbortController()
+  try {
+    const events = streamMessage(
+      useSettings.getState().apiKey ?? '',
+      {
+        model: MODEL,
+        system: SYSTEM_PROMPT,
+        messages,
+        thinking: { type: 'disabled' },
+        max_tokens: 32,
+        title: { enabled: true },
+      },
+      controller.signal
+    )
+    for await (const event of events) {
+      if (event.type !== 'message_delta') {
+        continue
+      }
+      const title = event.delta.title?.trim()
+      if (title) {
+        updateSession(sessionId, (current) =>
+          current.title?.trim() ? current : { ...current, title }
+        )
+        persist(sessionId)
+      }
+      break
+    }
+  } catch {
+    // 标题补发失败不影响主流程
+  } finally {
+    controller.abort()
+  }
 }
 
 /** 允许自动补标题的请求；手动重命名后取消本轮标题写入，包含主动清空标题的情况。 */
@@ -986,12 +1080,15 @@ const waitForRetry = (attempt: number, signal: AbortSignal) =>
  */
 const streamReply = async (sessionId: string, initial: AssistantMessage, request: Request) => {
   const controller = new AbortController()
-  if (!getSession(sessionId)?.title) {
+  const wantsTitle = !getSession(sessionId)?.title
+  if (wantsTitle) {
     titleRequests.add(controller)
   }
   set((state) => ({ streaming: { ...state.streaming, [sessionId]: controller } }))
   let reply = initial
   let frame = 0
+  /** 超长分支不能再带 title，回复成功后单独补发一次 */
+  let needsTitleFallback = false
   const flush = () => {
     cancelAnimationFrame(frame)
     frame = 0
@@ -1021,6 +1118,22 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           initial.thinking ?? false,
           latestReminder
         )
+        /**
+         * ⚠ 核心避坑指南：
+         * 官方 API 对 safety_check、deepseek_read_url、deepseek_web_search 这三个扩展存在 32K 的隐藏输入硬限制。
+         * 实测 title 同样会触发该限制（40K 文本只带 title 也返回 400），因此必须一并剥离，
+         * 会话标题改由回复结束后 requestTitle 用一次小请求补发。
+         * 当上下文累计超长，或带有 document(file_id) 附件时，必须走 extensions = false 分支，
+         * 剥离上述扩展以启用原生 1M 通道。
+         */
+        const extensions = estimateTokens(messages, SYSTEM_PROMPT) <= EXTENSION_TOKEN_LIMIT
+        needsTitleFallback ||= !extensions
+        if (!extensions) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            '⚠️ 上下文超长，已停用 safety_check、deepseek_read_url、title 与服务端搜索以突破 32K 输入限制。'
+          )
+        }
         const events = streamMessage(
           useSettings.getState().apiKey ?? '',
           {
@@ -1028,9 +1141,13 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
             system: SYSTEM_PROMPT,
             messages,
             thinking: { type: initial.thinking ? 'enabled' : 'disabled' },
-            safety_check: SAFETY_CHECK,
-            tools: serverTools(initial.search ?? false),
-            ...(titleRequests.has(controller) ? { title: { enabled: true } } : {}),
+            ...(extensions
+              ? {
+                  safety_check: SAFETY_CHECK,
+                  tools: serverTools(initial.search ?? false),
+                  ...(titleRequests.has(controller) ? { title: { enabled: true } } : {}),
+                }
+              : {}),
           },
           controller.signal
         )
@@ -1115,5 +1232,13 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
       ),
     }))
     persist(sessionId)
+    if (wantsTitle && needsTitleFallback && reply.status === 'done') {
+      const opening = getSession(sessionId)?.messages.find((message) => message.role === 'user')
+      void requestTitle(
+        sessionId,
+        opening?.role === 'user' ? opening.content : '',
+        getReplyText(reply)
+      )
+    }
   }
 }
